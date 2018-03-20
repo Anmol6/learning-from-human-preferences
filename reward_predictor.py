@@ -409,6 +409,8 @@ class RewardPredictorEnsemble:
                 self.test_writer = tf.summary.FileWriter(
                     osp.join(log_dir, 'reward_pred', 'test'), flush_secs=5)
 
+            self.summaries_extra = tf.summary.merge_all()
+
         if name == 'ps':
             server.join()
 
@@ -570,9 +572,12 @@ class RewardPredictorEnsemble:
                 feed_dict[rp.s2] = s2s
                 feed_dict[rp.mu] = mus
                 feed_dict[rp.training] = True
-            summaries, _ = self.sess.run([self.summaries, self.train_ops],
-                                         feed_dict)
+            summaries, summaries_extra, _ = self.sess.run([self.summaries,
+                                                           self.summaries_extra,
+                                                           self.train_ops],
+                                                          feed_dict)
             self.train_writer.add_summary(summaries, self.n_steps)
+            self.train_writer.add_summary(summaries_extra, self.n_steps)
             self.n_steps += 1
             print("Trained reward predictor for %d steps" % self.n_steps)
 
@@ -693,10 +698,19 @@ class RewardPredictor:
         with tf.control_dependencies([c1]):
             loss = tf.reduce_sum(_loss)
 
+        step = tf.Variable(0, trainable=False)
         # Make sure that batch normalization ops are updated
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
         with tf.control_dependencies(update_ops):
-            train = tf.train.AdamOptimizer(learning_rate=lr).minimize(loss)
+            train = tf.contrib.layers.optimize_loss(loss=loss,
+                                                    global_step=step,
+                                                    learning_rate=lr,
+                                                    optimizer='Adam',
+                                                    summaries=["learning_rate",
+                                                               "loss",
+                                                               "gradients",
+                                                               "gradient_norm",
+                                                               "global_gradient_norm"])
 
         # TODO (L2 loss)
         """
