@@ -233,6 +233,9 @@ def make_env(env_id, seed=0):
     if env_id == 'EnduroNoFrameskip-v4':
         from enduro_wrapper import EnduroWrapper
         env = EnduroWrapper(env)
+    elif env_id == 'PongNoFrameskip-v4':
+        from pong_wrapper import PongWrapper
+        env = PongWrapper(env)
     return wrap_deepmind(env)
 
 class PrefDB:
