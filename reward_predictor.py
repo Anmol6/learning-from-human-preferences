@@ -57,6 +57,7 @@ class RewardPredictorEnsemble:
             # which seems to be needed in order to avoid confusing saver.restore()
             # when restoring from FloydHub runs.
             self.saver = tf.train.Saver(max_to_keep=1, save_relative_paths=True)
+            self.summaries_extra = tf.summary.merge_all()
             self.summaries = self.add_summary_ops()
 
         self.checkpoint_file = osp.join(log_dir,
@@ -251,9 +252,10 @@ class RewardPredictorEnsemble:
             feed_dict[rp.s2] = s2s
             feed_dict[rp.pref] = prefs
             feed_dict[rp.training] = True
-        ops = [self.summaries, [rp.train for rp in self.rps]]
-        summaries, _ = self.sess.run(ops, feed_dict)
+        ops = [self.summaries, self.summaries_extra, [rp.train for rp in self.rps]]
+        summaries, summaries_extra, _ = self.sess.run(ops, feed_dict)
         self.train_writer.add_summary(summaries, self.n_steps)
+        self.train_writer.add_summary(summaries_extra, self.n_steps)
 
     def val_step(self, prefs_val):
         val_batch_size = 32
@@ -371,8 +373,18 @@ class RewardPredictorNetwork:
         # Make sure that batch normalization ops are updated
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
 
+        step = tf.Variable(0, trainable=False)
+
         with tf.control_dependencies(update_ops):
-            train = tf.train.AdamOptimizer(learning_rate=lr).minimize(loss)
+            train = tf.contrib.layers.optimize_loss(loss=loss,
+                                                    global_step=step,
+                                                    learning_rate=lr,
+                                                    optimizer='Adam',
+                                                    summaries=["learning_rate",
+                                                               "loss",
+                                                               "gradients",
+                                                               "gradient_norm",
+                                                               "global_gradient_norm"])
 
         # Inputs
         self.training = training
