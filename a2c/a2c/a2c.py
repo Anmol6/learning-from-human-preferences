@@ -1,4 +1,4 @@
-import logging
+import os
 import os.path as osp
 import queue
 import time
@@ -9,11 +9,18 @@ import numpy as np
 from numpy.testing import assert_equal
 import tensorflow as tf
 
-from a2c import logger
-from a2c.a2c.utils import (cat_entropy, discount_with_dones,
-                           find_trainable_variables, mse)
-from a2c.common import explained_variance, set_global_seeds
-from pref_db import Segment
+import params as run_params
+from openai_baselines import logger
+from openai_baselines.a2c.utils import (cat_entropy, discount_with_dones,
+                                        find_trainable_variables, mse)
+from openai_baselines.common import explained_variance, set_global_seeds
+from utils import Segment
+
+
+"""
+- states: model state (e.g. LSTM state)
+- masks: is only used for stateful models
+"""
 
 
 class Model(object):
@@ -70,6 +77,9 @@ class Model(object):
             n_steps = len(obs)
             for _ in range(n_steps):
                 cur_lr = lr_scheduler.value()
+            if run_params.params['print_lr']:
+                import datetime
+                print(str(datetime.datetime.now()), cur_lr)
             td_map = {
                 train_model.X: obs,
                 A: actions,
@@ -107,21 +117,19 @@ class Model(object):
 
     def save(self, ckpt_path, step_n):
         # TODO put back step_n
-        saved_path = self.saver.save(self.sess, ckpt_path)
-        print("Saved policy checkpoint to '{}'".format(saved_path))
+        return self.saver.save(self.sess, ckpt_path)
 
 
 class Runner(object):
     def __init__(self,
                  env,
                  model,
-                 nsteps,
-                 nstack,
-                 gamma,
-                 gen_segments,
                  seg_pipe,
-                 reward_predictor,
-                 episode_vid_queue):
+                 nsteps=5,
+                 nstack=4,
+                 gamma=0.99,
+                 reward_predictor=None,
+                 episode_vid_queue=None):
         self.env = env
         self.model = model
         nh, nw, nc = env.observation_space.shape
@@ -136,16 +144,14 @@ class Runner(object):
         self.nsteps = nsteps
         self.states = model.initial_state
         self.dones = [False for _ in range(nenv)]
-
-        self.gen_segments = gen_segments
         self.segment = Segment()
+        self.episode_frames = []
         self.seg_pipe = seg_pipe
+        self.reward_predictor = reward_predictor
+        self.episode_vid_queue = episode_vid_queue
 
         self.orig_reward = [0 for _ in range(nenv)]
-        self.reward_predictor = reward_predictor
-
-        self.episode_frames = []
-        self.episode_vid_queue = episode_vid_queue
+        self.sess = tf.Session()
 
     def update_obs(self, obs):
         # Do frame-stacking here instead of the FrameStack wrapper to reduce
@@ -153,9 +159,9 @@ class Runner(object):
         self.obs = np.roll(self.obs, shift=-1, axis=3)
         self.obs[:, :, :, -1] = obs[:, :, :, 0]
 
-    def update_segment_buffer(self, mb_obs, mb_rewards, mb_dones):
-        # Segments are only generated from the first worker.
-        # Empirically, this seems to work fine.
+    def gen_segments(self, mb_obs, mb_rewards, mb_dones):
+        # Only generate segments from the first environment
+        # TODO: is this the right choice...?
         e0_obs = mb_obs[0]
         e0_rew = mb_rewards[0]
         e0_dones = mb_dones[0]
@@ -164,15 +170,7 @@ class Runner(object):
         assert_equal(e0_dones.shape, (self.nsteps, ))
 
         for step in range(self.nsteps):
-            self.segment.append(np.copy(e0_obs[step]), np.copy(e0_rew[step]))
-            if len(self.segment) == 25 or e0_dones[step]:
-                while len(self.segment) < 25:
-                    # Pad to 25 steps long so that all segments in the batch
-                    # have the same length.
-                    # Note that the reward predictor needs the full frame
-                    # stack, so we send all frames.
-                    self.segment.append(e0_obs[step], 0)
-                self.segment.finalise()
+            if len(self.segment) == 25:
                 try:
                     self.seg_pipe.put(self.segment, block=False)
                 except queue.Full:
@@ -181,14 +179,22 @@ class Runner(object):
                     # the segment and keep on going.
                     pass
                 self.segment = Segment()
+                continue
+            elif e0_dones[step]:
+                # The last segment will probably not be 25 steps long;
+                # drop it, so that all segments in the batch are the same
+                # length
+                self.segment = Segment()
+                continue
+            self.segment.append(e0_obs[step], e0_rew[step])
 
-    def update_episode_frame_buffer(self, mb_obs, mb_dones):
+    def save_episode_frames(self, mb_obs, mb_dones):
         e0_obs = mb_obs[0]
         e0_dones = mb_dones[0]
+
         for step in range(self.nsteps):
-            # Here we only need to send the last frame (the most recent one)
-            # from the 4-frame stack, because we're just showing output to
-            # the user.
+            # Append the last frame (the most recent one) from the 4-frame
+            # stack
             self.episode_frames.append(e0_obs[step, :, :, -1])
             if e0_dones[step]:
                 self.episode_vid_queue.put(self.episode_frames)
@@ -204,6 +210,13 @@ class Runner(object):
         for _ in range(self.nsteps):
             actions, values, states = self.model.step(self.obs, self.states,
                                                       self.dones)
+            # TODO: move this down below
+            if run_params.params['env'] == 'MovingDotNoFrameskip-v0':
+                # For MovingDot, reward depends on both current observation and
+                # action, so encode action in the observations
+                # Offset of 100 so it doesn't interfere with oracle position
+                # finding
+                self.obs[:, 0, 0, -1] = 100 + actions[:]
             mb_obs.append(np.copy(self.obs))
             mb_actions.append(actions)
             mb_values.append(values)
@@ -215,6 +228,8 @@ class Runner(object):
             for n, done in enumerate(dones):
                 if done:
                     self.obs[n] = self.obs[n] * 0
+                    if run_params.params['debug']:
+                        print("Env %d done" % n)
             # SubprocVecEnv automatically resets when done
             self.update_obs(obs)
             mb_rewards.append(rewards)
@@ -243,25 +258,20 @@ class Runner(object):
                         self.orig_reward[env_n])
                     self.orig_reward[env_n] = 0
 
-        if self.env.env_id == 'MovingDotNoFrameskip-v0':
-            # For MovingDot, reward depends on both current observation and
-            # current action, so encode action in the observations.
-            # (We only need to set this in the most recent frame,
-            # because that's all that the reward predictor for MovingDot
-            # uses.)
-            mb_obs[:, :, 0, 0, -1] = mb_actions[:, :]
-
         # Generate segments
-        # (For MovingDot, this has to happen _after_ we've encoded the action
-        # in the observations.)
-        if self.gen_segments:
-            self.update_segment_buffer(mb_obs, mb_rewards, mb_dones)
+        if self.reward_predictor:
+            self.gen_segments(mb_obs, mb_rewards, mb_dones)
+
+        # Save frames for episode rendering
+        if self.episode_vid_queue is not None:
+            self.save_episode_frames(mb_obs, mb_dones)
 
         # Replace rewards with those from reward predictor
-        # (Note that this also needs to be done _after_ we've encoded the
-        # action.)
-        logging.debug("Original rewards:\n%s", mb_rewards)
+        if run_params.params['debug']:
+            print("Original rewards:\n", mb_rewards)
         if self.reward_predictor:
+            orig_rewards = np.copy(mb_rewards)
+
             assert_equal(mb_obs.shape, (nenvs, self.nsteps, 84, 84, 4))
             mb_obs_allenvs = mb_obs.reshape(nenvs * self.nsteps, 84, 84, 4)
 
@@ -270,11 +280,12 @@ class Runner(object):
             mb_rewards = rewards_allenvs.reshape(nenvs, self.nsteps)
             assert_equal(mb_rewards.shape, (nenvs, self.nsteps))
 
-            logging.debug("Predicted rewards:\n%s", mb_rewards)
+            ev = explained_variance(mb_rewards.flatten(),
+                                    orig_rewards.flatten())
+            logger.record_tabular("explained_variance_predicted_rewards", ev)
 
-        # Save frames for episode rendering
-        if self.episode_vid_queue is not None:
-            self.update_episode_frame_buffer(mb_obs, mb_dones)
+            if run_params.params['debug']:
+                print("Predicted rewards:\n", mb_rewards)
 
         # Discount rewards
         mb_obs = mb_obs.reshape(self.batch_ob_shape)
@@ -306,8 +317,9 @@ class Runner(object):
 def learn(policy,
           env,
           seed,
-          start_policy_training_pipe,
-          ckpt_save_dir,
+          seg_pipe,
+          go_pipe,
+          log_dir,
           lr_scheduler,
           nsteps=5,
           nstack=4,
@@ -319,10 +331,8 @@ def learn(policy,
           alpha=0.99,
           gamma=0.99,
           log_interval=100,
-          ckpt_save_interval=1000,
-          ckpt_load_dir=None,
-          gen_segments=False,
-          seg_pipe=None,
+          load_path=None,
+          save_interval=1000,
           reward_predictor=None,
           episode_vid_queue=None):
 
@@ -350,51 +360,54 @@ def learn(policy,
             alpha=alpha,
             epsilon=epsilon)
 
-    with open(osp.join(ckpt_save_dir, 'make_model.pkl'), 'wb') as fh:
+    ckpt_dir = osp.join(log_dir, 'policy_checkpoints')
+    os.makedirs(ckpt_dir)
+    with open(osp.join(ckpt_dir, 'make_model.pkl'), 'wb') as fh:
         fh.write(cloudpickle.dumps(make_model))
 
     print("Initialising policy...")
-    if ckpt_load_dir is None:
+    if load_path is None:
         model = make_model()
     else:
-        with open(osp.join(ckpt_load_dir, 'make_model.pkl'), 'rb') as fh:
+        with open(osp.join(load_path, 'make_model.pkl'), 'rb') as fh:
             make_model = cloudpickle.loads(fh.read())
         model = make_model()
 
-        ckpt_load_path = tf.train.latest_checkpoint(ckpt_load_dir)
-        model.load(ckpt_load_path)
-        print("Loaded policy from checkpoint '{}'".format(ckpt_load_path))
+        ckpt_path = tf.train.latest_checkpoint(load_path)
+        model.load(ckpt_path)
+        print("Loaded policy from checkpoint '{}'".format(ckpt_path))
 
-    ckpt_save_path = osp.join(ckpt_save_dir, 'policy.ckpt')
+    ckpt_path = osp.join(ckpt_dir, 'policy')
 
-    runner = Runner(env=env,
-                    model=model,
-                    nsteps=nsteps,
-                    nstack=nstack,
-                    gamma=gamma,
-                    gen_segments=gen_segments,
-                    seg_pipe=seg_pipe,
-                    reward_predictor=reward_predictor,
-                    episode_vid_queue=episode_vid_queue)
+    runner = Runner(
+        env,
+        model,
+        seg_pipe,
+        nsteps=nsteps,
+        nstack=nstack,
+        gamma=gamma,
+        reward_predictor=reward_predictor,
+        episode_vid_queue=episode_vid_queue)
 
     # nsteps: e.g. 5
     # nenvs: e.g. 16
     nbatch = nenvs * nsteps
     fps_tstart = time.time()
     fps_nsteps = 0
+    train = False
 
     print("Starting agent(s)")
 
     # Before we're told to start training the policy itself,
     # just generate segments for the reward predictor to be trained with
-    while True:
-        runner.run()
+    while not train:
+        obs, states, rewards, masks, actions, values = runner.run()
         try:
-            start_policy_training_pipe.get(block=False)
+            go_pipe.get(block=False)
         except queue.Empty:
             continue
         else:
-            break
+            train = True
 
     print("Starting policy training")
 
@@ -404,8 +417,6 @@ def learn(policy,
 
         policy_loss, value_loss, policy_entropy, cur_lr = model.train(
             obs, states, rewards, masks, actions, values)
-
-        print("Trained policy for {} time steps".format((update + 1) * nbatch))
 
         fps_nsteps += nbatch
 
@@ -424,7 +435,6 @@ def learn(policy,
             logger.record_tabular("learning_rate", cur_lr)
             logger.dump_tabular()
 
-        if update != 0 and update % ckpt_save_interval == 0:
-            model.save(ckpt_save_path, update)
-
-    model.save(ckpt_save_path, update)
+        if update % save_interval == 0 and update != 0:
+            last_ckpt = model.save(ckpt_path, update)
+            print("Saved policy checkpoint to '{}'".format(last_ckpt))
